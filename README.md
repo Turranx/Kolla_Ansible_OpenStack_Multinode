@@ -7,9 +7,9 @@ Where this fails is during the final deployment step:
 kolla-ansible -i /usr/local/kolla_venv/multinode deploy
 
 
-Deploy == Broken!
-https://bugs.launchpad.net/kolla-ansible/+bug/1958268
-TASK [nova-cell : Waiting for nova-compute services to register themselves] ***********************************************************************************************************************************************************
+Deploy == Broken!  
+https://bugs.launchpad.net/kolla-ansible/+bug/1958268  
+TASK [nova-cell : Waiting for nova-compute services to register themselves] ***********************************************************************************************************************************************************  
 skipping: [kolla2]
 skipping: [kolla3]
 FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (20 retries left).

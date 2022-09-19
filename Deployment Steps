@@ -1,0 +1,1625 @@
+# This is based upon https://docs.openstack.org/kolla-ansible/latest/user/quickstart.html
+#                    https://www.itugasmu.com/2021/11/deploy-openstack-with-kolla-ansible.html
+#                    https://docs.openstack.org/kolla-ansible/yoga/reference/storage/external-ceph-guide.html
+#                    https://docs.ceph.com/en/quincy/cephadm/install/
+
+
+
+# In version 5 of this document...
+#	we tried pushing Ceph traffic off to its own NIC.  This did not appear to have an effect.
+#   It was also observed that during the 'Kolla Ansible bootstrap proccess' Ceph was falling over dead.
+#   I'm sure this has something to do with KAO's bootstrap process mucking about with the Docker instance
+#   that Ceph had already installed, configured, and was using.
+
+# In version 6 of this document...
+#   we will try calling the 'Kolla Ansible bootstrap proccess' early, which should(?) install (configure?) Docker
+#   for OpenStack, but also allow a Ceph install to piggyback upon the same Docker setup without issues (hopefully).
+#   NOTE:  This worked.  Docker stayed online during the install of KAO.  
+
+
+#############################################################
+# Prerequisites for the environment
+#############################################################
+* Hyper-V on a physical host with 32 GB RAM
+* Hyper-V Console > Host > Virtual Switch Manager > MAC Address Range
+    - Minimum: 00-15-00-00-00-00
+    - Maximum: 00-15-FF-FF-FF-FF
+* VM pfSense/opnSense VM to provide NAT and firewall for OpenStack cluster
+* Perform a search & replace on this document for the domain name:
+        - openstack.diy
+* 
+
+#############################################################
+# IP Address Scheme
+#############################################################
+# Region   Network       IP Range Start    IP Range End    Subnet
+#================================================================
+# US       IPMI          192.166.8.0         192.166.3.255     /22 (255.255.252.0)
+# US       Storage       192.166.4.0         192.166.7.255     /22
+# US       Controller    192.166.8.0         192.166.11.255    /22
+#
+# EU       IPMI          192.167.0.0         192.167.3.255     /22
+# EU       Storage       192.167.4.0         192.167.7.255     /22
+# EU       Controller    192.167.8.0         192.167.11.255    /22
+#
+# AP       IPMI          192.168.0.0         192.168.3.255     /22
+# AP       Storage       192.168.4.0         192.168.7.255     /22
+# AP       Controller    192.168.8.0         192.168.11.255    /22
+
+
+# Network       Node Name         IP Address          IP Type        MAC Address           NIC       Purpose
+#==============================================================================================================================
+# Controller    opnSense          192.166.8.1         Fixed          00:15:0a:20:08:01     eth0      Gateway to Internet
+# Controller    beachhead         192.166.8.2         Fixed          00:15:0a:20:08:02     eth0      DNS, DHCP?, Apt-Cache, Deployment Automation Coordination
+# Controller    template          192.166.8.3         Fixed          00:15:0a:20:08:03     eth0      Ubuntu 20:04 LTS VM Template
+# Controller    Hyper-V Host      192.166.8.4         Fixed                                          So my laptop can ssh into all these VMs
+# Controller    kolla             192.166.8.10        Fixed          <floating IP>                   OpenStack Cluster Floating Virtual IP 
+# Controller    kolla1            192.166.8.11        Fixed          00:15:0a:20:08:0b     eth0      OpenStack Node #1  (Controller, Compute)
+# Controller    kolla2            192.166.8.12        Fixed          00:15:0a:20:08:0c     eth0      OpenStack Node #2  (Controller, Compute)
+# Controller    kolla3            192.166.8.13        Fixed          00:15:0a:20:08:0d     eth0      OpenStack Node #3  (Controller, Compute)
+# Storage       kolla1            192.166.4.11        Fixed          00:15:0a:20:04:0b     eth2      OpenStack Node #1  (Storage)
+# Storage       kolla2            192.166.4.12        Fixed          00:15:0a:20:04:0c     eth2      OpenStack Node #2  (Storage)
+# Storage       kolla3            192.166.4.13        Fixed          00:15:0a:20:04:0d     eth2      OpenStack Node #3  (Storage)
+# Controller    kolla1            <Assigned by OpenStack>            Hyper-V Dynamic       eth1      OpenStack Node #1  (Neutron)
+# Controller    kolla2            <Assigned by OpenStack>            Hyper-V Dynamic       eth1      OpenStack Node #2  (Neutron)
+# Controller    kolla3            <Assigned by OpenStack>            Hyper-V Dynamic       eth1      OpenStack Node #3  (Neutron)
+
+
+#############################################################
+# Create Hyper-V Virtual Switches
+# Run the following on the Hyper-V host in PowerShell
+#############################################################
+# Create Virtual Switches
+    $ErrorActionPreference = "Stop";
+
+    If ((Get-VMSwitch | WHERE {$_.name -ieq 'Physical Access'}).count -eq 0) {
+        $PhysicalNIC = Get-NetAdapter -Physical | WHERE {$_.Status -eq 'UP'} | Select -First 1;
+        Hyper-V\New-VMSwitch -name Physical_Access `
+                             -NetAdapterName $PhysicalNIC.Name `
+                             -AllowManagementOs $true `
+                             -Notes "Connect WAN of opnSense here.";
+    }
+
+    If ((Get-VMSwitch | WHERE {$_.name -ieq 'Controller'}).count -eq 0) {
+        Hyper-V\New-VMSwitch    -Name Controller `
+                                -SwitchType Internal `
+                                -Notes "Connect LAN of opnSense here.";
+    }
+
+    If ((Get-VMSwitch | WHERE {$_.name -ieq 'Storage'}).count -eq 0) {
+        Hyper-V\New-VMSwitch    -Name Storage `
+                                -SwitchType Private `
+                                -Notes "This switch carries Ceph internal cluster traffic.";
+    }
+
+
+
+#############################################################
+# Set Hyper-V's own NICs
+#############################################################
+# This tutorial was run from a single laptop.  The laptop had Hyper-V installed.
+# Once a Hyper-V virtual switch is created, a new virtual NIC appears that allows 
+# the host to access it (type: Internal).  The next step is to go into "NCPA.cpl" 
+# and assign an IP addresses to the new virtual NIC.
+#
+#    New Virtual NIC                Assign This IP
+#==============================================
+#    vEthernet(Controller)        192.166.8.4/22
+#    vEthernet(Storage)           192.166.4.4/22
+
+
+#############################################################
+# Create a Ubuntu 20:04 LTS Template
+# Run the following on the Hyper-V host in PowerShell
+#############################################################
+    $ErrorActionPreference = "Stop";
+    $DefaultVMHostProperties = Get-VMHost;
+
+    $VMNames               = @("Ubuntu 20.04LTS Template");
+    $NetworkSwitch_Default = (Hyper-V\Get-VMSwitch -Name 'Controller').Name;
+    $OSInstallDisk         = 'D:\MyUserAccount\Downloads\OS_Images\ubuntu-20:04.4-live-server-amd64.iso';
+    $RamSize               = 2GB;
+    $DiskSize              = 127GB;
+    $VHDpath               = $DefaultVMHostProperties.VirtualHardDiskPath;
+
+    ForEach ($VMName in $VMNames) {
+        # Remove previous VM
+        Try {
+            $VM = Hyper-V\Get-VM -Name $VMName;
+            $VM | Hyper-V\Remove-VMSnapshot -IncludeAllChildSnapshots;
+            $VM.HardDrives.Path | Remove-Item -Force;
+            $VM | Hyper-V\Remove-VM -Force;
+        }
+        Catch {
+            $Error.Clear();
+        }
+
+        Remove-Variable VM -ErrorAction SilentlyContinue;
+
+        $VM = Hyper-V\New-VM `
+                        -Name                      $VMName `
+                        -MemoryStartupBytes        $RamSize `
+                        -Generation                1 `
+                        -NewVHDSizeBytes           $DiskSize `
+                        -NewVHDPath                ((Join-Path $VHDpath $VMName) + ".vhdx") `
+                        -SwitchName                $NetworkSwitch_Default;
+
+        $VM | Hyper-V\Set-VMProcessor -Count 2 -ExposeVirtualizationExtensions $False;
+        $VM | Set-VMBios -EnableNumLock;
+        $VM | Set-VMMemory -DynamicMemoryEnabled $true -StartupBytes $RamSize;
+        $VM | Set-VM -AutomaticCheckpointsEnabled $false;
+        $VM.NetworkAdapters | Set-VMNetworkAdapter -MacAddressSpoofing False;
+        $VM.DVDDrives       | Set-VMDvdDrive -Path $OSInstallDisk;
+    }
+
+Hyper-V\Get-VMNetworkAdapter -VMName "template" `
+    | WHERE {$_.SwitchName -ieq 'Controller'} `
+    | Set-VMNetworkAdapter -StaticMacAddress "00150a200803"
+
+#
+# Template OS Installation Procedure:
+#   * Power on the VM
+#   * Provide the following Network/Identification information:
+#   * IP Address:    192.166.8.3
+#   * Subnet:        192.166.8.0/16
+#   * Gateway:       192.166.8.1
+#   * DNS Server:    8.8.8.8
+#   * DNS Domain:    openstack.diy
+#   * Hostname:      template
+#   * Username:      <your_choice>
+#   * Password:      <your_choice>
+#
+#   * Package choices
+#   * OpenSSH:       Yes
+#   * Other:         No other packages selected
+# Wait for OS to finish installing
+# Reboot and unmount CD-ROM
+
+
+
+#############################################################
+# Take a snapshot of the Template VM
+# Run the following on the Hyper-V host
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Checkpoint-VM -SnapshotName "Fresh Install";
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Start-VM;
+
+
+
+#############################################################
+# Configure the Template VM: Credentials
+# Run the following on Template server via SSH
+#############################################################
+# Import SSH key from GitHub
+ssh-import-id-gh MyUserAccount-MyDomain
+
+# Put personal SSH key on VM
+# Paste in contents of C:\Users\MyUserAccount\.ssh\id_ed25519
+nano ~/.ssh/id_ed25519
+chmod 600 ~/.ssh/id_ed25519
+
+# Paste in contents of C:\Users\MyUserAccount\.ssh\id_ed25519.ppk
+nano ~/.ssh/id_ed25519.pub
+
+# Register private key with SSH
+eval `ssh-agent -s`
+ssh-add
+
+# Allow SUDO without password
+echo "`whoami`  ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/`whoami`
+
+# Increase SUDO timeout to 60 minutes
+# This will go active on the next reboot
+sudo sed -i 's/env_reset/env_reset,timestamp_timeout=60/g' /etc/sudoers
+
+sudo tee /etc/apt/apt.conf.d/00aptproxy<<EOF
+Acquire::http::Proxy "http://192.166.8.2:3142";
+EOF
+
+
+
+#############################################################
+# Take a snapshot of the Template VM
+# Run the following on the Hyper-V host
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Checkpoint-VM -SnapshotName "Credentials Installed";
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Start-VM;
+
+
+
+#############################################################
+# Configure the Template VM: Netplan
+# Run the following on Template server via SSH
+#############################################################
+
+# Create a new Netplan document with IP addresses for all OpenStack Nodes
+sudo tee /etc/netplan/00-installer-config.yaml<<EOF
+network:
+  version: 2
+  ethernets:
+
+	# NOTE:  If the MAC Address is not listed here, then it is ignored by NetPlan.
+	#        When ignored by NetPlan, the NIC 
+    Beachhead_controller:
+      match:
+        macaddress:  "00:15:0a:20:08:02"
+      addresses:   [ "192.166.8.2/22" ]
+      #hostname:      beachhead
+      gateway4:      192.166.8.1
+      nameservers:
+        addresses: [ "192.166.8.2","8.8.8.8" ]
+        search:    [ "openstack.diy" ]
+
+    Template_controller:
+      match:
+        macaddress:  "00:15:0a:20:08:03"
+      addresses:   [ "192.166.8.3/22" ]
+      #hostname:      template
+      gateway4:      192.166.8.1
+      nameservers:
+        addresses: [ "192.166.8.2","8.8.8.8" ]
+        search:    [ "openstack.diy" ]
+
+
+    kolla1_controller:
+      match:
+        macaddress:  "00:15:0a:20:08:0b"
+      #hostname:      kolla1
+      addresses:   [ "192.166.8.11/22" ]
+      gateway4:       192.166.8.1
+      nameservers:
+        addresses: [ "192.166.8.2" ]
+        search:    [ "openstack.diy" ]
+
+    kolla1_storage:
+      match:
+        macaddress:  "00:15:0a:20:04:0b"
+      #hostname:      kolla1
+      addresses:   [ "192.166.4.11/22" ]
+      nameservers:
+        addresses: [ "192.166.8.2" ]
+        search:    [ "ceph.diy" ]
+
+
+    kolla2_controller:
+      match:
+        macaddress:  "00:15:0a:20:08:0c"
+      #hostname:      kolla2
+      addresses:   [ "192.166.8.12/22" ]
+      gateway4:       192.166.8.1
+      nameservers:
+        addresses: [ "192.166.8.2" ]
+        search:    [ "openstack.diy" ]
+
+    kolla2_storage:
+      match:
+        macaddress:  "00:15:0a:20:04:0c"
+      #hostname:      kolla2
+      addresses:   [ "192.166.4.12/22" ]
+      nameservers:
+        addresses: [ "192.166.8.2" ]
+        search:    [ "ceph.diy" ]
+		
+
+    kolla3_controller:
+      match:
+        macaddress:  "00:15:0a:20:08:0d"
+      #hostname:      kolla3
+      addresses:   [ "192.166.8.13/22" ]
+      gateway4:       192.166.8.1
+      nameservers:
+        addresses: [ "192.166.8.2" ]
+        search:    [ "openstack.diy" ]
+
+    kolla3_storage:
+      match:
+        macaddress:  "00:15:0a:20:04:0d"
+      #hostname:      kolla3
+      addresses:   [ "192.166.4.13/22" ]
+      nameservers:
+        addresses: [ "192.166.8.2" ]
+        search:    [ "ceph.diy" ]
+EOF
+
+# Install project "yq" to parse YAML files
+sudo snap install yq
+
+# NOTE:  Reading/Writing protected files with yq
+#  https://github.com/mikefarah/yq#snap-notes
+
+sudo tee /root/sethostname.sh<<'EOF'
+#!/bin/bash
+
+echo "======================================="
+echo "`date -u`"
+
+currenthostname=`hostname`
+
+# Get all MAC addresses from all NICs in host
+macaddresses=`cat /sys/class/net/*/address`
+
+# Iterate through all MAC addresses
+for mac in $macaddresses; do
+
+  if [[ "$mac" == "00:00:00:00:00:00" ]]
+  then
+    continue
+  fi
+
+  echo "Looking for MAC address $mac in Netplan config file..."
+  
+  # Is $mac inside the Netplan config document?
+  # Yes ==> Continue with loop iteration
+  # No  ==> Exit loop iteration and start loop with next $mac
+  
+  count=`sudo cat /etc/netplan/00-installer-config.yaml | grep "$mac" | wc -l`
+  if (( count == 0 ))
+  then
+    echo "MAC address $mac not found.  Going to next MAC..."
+    continue
+  fi
+  
+  # Get Hostname based on MAC address from Netplan YAML file
+  # NOTE_1:  YQ can't be called directly with SUDO, so we have to use "sudo cat..." here.
+  # NOTE_2:  Netplan can make many adjustments to a system, but cannot assign a hostname.
+  # NOTE_3:  Netplan identifies extra YAML entries that do do not fit its official schema and throws an error.  Netplan ignores commented lines (#).
+  # NOTE_4:  Sed can "uncomment lines" by removing the pound symbol (octothorpe).  Now YQ can see them, but Netplan can't.
+  # NOTE_5:  YQ returns a large matching block of YAML, but grep is the quickest way to extract the hostname from that block.
+  command=".network.ethernets | with_entries(select(.value.match.macaddress == \"$mac\"))"
+  #            NOTE_1                                           NOTE_4                               NOTE_1                    NOTE_5
+  newhostname=$currenthostname
+  newhostname=`sudo cat /etc/netplan/00-installer-config.yaml | sed 's/.*hostname/      hostname/' | /snap/bin/yq "$command" | /snap/bin/yq '.*.hostname'`
+  
+  IP=`sudo cat /etc/netplan/00-installer-config.yaml | sed 's/.*hostname/      hostname/' | /snap/bin/yq "$command" | /snap/bin/yq '.*.addresses[0]' | cut -d'/' -f1`
+
+  # If a hostname is defined in /etc/netplan/00-installer-config.yaml for this $mac, then process it here.
+  if [ -z "$newhostname" ]
+  then
+    echo "MAC address $mac does not have a defined hostname in the Netplan configuration file.  Not renaming host."
+  else
+    if [[ "$newhostname" == "$currenthostname" ]]
+    then
+      echo "Based upon the Netplan config file, this hostname is correct ($currenthostname).  Not renaming host."
+    else
+      #echo "Old Host Name: $currenthostname"
+      #echo "New Host Name: $newhostname"
+
+      # Change Hostname
+      echo "Changing hostname using hostnamectl..."
+      sudo hostnamectl set-hostname $newhostname
+
+      # Update Local hosts file
+      echo "Updating local /etc/hosts file..."
+      sudo sed -i "s/127\.0\.1\.1.*/127\.0\.1\.1 $newhostname.openstack.diy $newhostname/" /etc/hosts
+      echo "$IP $newhostname.openstack.diy $newhostname" | sudo tee -a /etc/hosts
+      
+      # Update DNS Server
+      # https://gist.github.com/mbrownnycnyc/5644413
+      arpa=$(printf 'arpa.in-addr.%s.' "$IP" | tac -s.)
+      fqdn=$(hostname -f)
+      mydnsserver=192.166.8.2
+      echo "server $mydnsserver
+      update add $fqdn 3600 IN A $IP
+      send
+      update add $arpa 3600 IN PTR $fqdn
+      send
+      quit
+      " | nsupdate
+
+      # Initiate Reboot
+      echo "Initiating reboot..."
+      #sudo reboot
+
+      # Exit Script with 'Success' flag
+      exit 0
+      echo "============================"
+    fi
+  fi
+done
+EOF
+sudo chmod +x /root/sethostname.sh
+
+# Create a job to run at reboot as root
+sudo su
+crontab -e
+# Add this line:
+#   SHELL=/bin/bash
+#   @reboot sleep 20; /root/sethostname.sh >> $HOME/crontab.log 2>&1
+# exit crontab
+exit
+
+# Install the TMUX script
+tee ~/tmux-into-KAO-nodes.sh<<-'EOF'
+    #!/bin/bash
+
+    split_list=()
+    for ssh_entry in "$@"
+    do
+        split_list+=( split-pane ssh "`whoami`@$ssh_entry" ';' )
+    done
+
+    tmux new-session ssh ';' \
+        "${split_list[@]}" \
+        select-layout tiled ';' \
+        set-option -w synchronize-panes
+EOF
+
+chmod +x ~/tmux-into-KAO-nodes.sh
+
+sudo apt install sshpass -y
+
+
+#############################################################
+# Take a snapshot of the Template VM
+# Run the following on the Hyper-V host
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "template"} | Checkpoint-VM -SnapshotName "Netplan Updated and Host Renaming Script Installed";
+
+
+
+#############################################################
+# Create a Beachhead Server
+# Run the following on the Hyper-V host in PowerShell
+#############################################################
+$ErrorActionPreference = "Stop";
+$DefaultVMHostProperties = Get-VMHost;
+
+$VMNames               = @("Beachhead");
+$NetworkSwitch_Default = (Hyper-V\Get-VMSwitch -Name 'Controller').Name;
+$OSInstallDisk         = 'D:\MyUserAccount\Downloads\OS_Images\ubuntu-20:04.4-live-server-amd64.iso';
+$RamSize               = 2GB;
+$DiskSize              = 127GB;
+$VHDpath               = $DefaultVMHostProperties.VirtualHardDiskPath;
+$TemplateSnapshot      = "Netplan Updated and Host Renaming Script Installed";
+
+# Export the Template's VHDX
+Remove-Item -Recurse -LiteralPath 'D:\Temp\Template' -ErrorAction Ignore;
+Hyper-V\Export-VMSnapshot -VM (Hyper-V\get-vm -Name "Ubuntu 20.04LTS Template") `
+                    -Name $TemplateSnapshot `
+                    -Path D:\Temp\Template;
+
+ForEach ($VMName in $VMNames) {
+    # Remove previous VM
+    Try {
+        $VM = Hyper-V\Get-VM -Name $VMName;
+        $VM | Hyper-V\Remove-VMSnapshot -IncludeAllChildSnapshots;
+        $VM.HardDrives.Path | Remove-Item -Force -ErrorAction Ignore;
+        $VM | Hyper-V\Remove-VM -Force;
+    }
+    Catch {
+        $Error.Clear();
+    }
+
+    # Remove any lingering hard drives
+    Get-ChildItem -Path D:\Hyper-V -Filter "Beachhead*" | Remove-Item -Force -ErrorAction Ignore;
+
+    Remove-Variable VM -ErrorAction SilentlyContinue;
+
+    $VM = Hyper-V\New-VM `
+                    -Name                      $VMName `
+                    -MemoryStartupBytes        $RamSize `
+                    -Generation                1 `
+                    -NewVHDSizeBytes           $DiskSize `
+                    -NewVHDPath                ((Join-Path $VHDpath $VMName) + ".vhdx") `
+                    -SwitchName                $NetworkSwitch_Default;
+
+    $VM | Hyper-V\Set-VMProcessor -Count 2 -ExposeVirtualizationExtensions $false;
+    $VM | Set-VMBios -EnableNumLock;
+    $VM | Set-VMMemory -DynamicMemoryEnabled $true -StartupBytes $RamSize;
+    $VM | Set-VM -AutomaticCheckpointsEnabled $false;
+    
+    # Remove the hard disk that was created.
+    Remove-Item -LiteralPath "D:\Hyper-V\$($VMName).vhdx" -Force;
+
+    # Copy and rename the Template VHDX into this VM
+    Copy-Item -LiteralPath 'D:\Temp\Template\Ubuntu 20.04LTS Template\Virtual Hard Disks\Ubuntu 20.04LTS Template.vhdx' `
+            -Destination "D:\Hyper-V\$($VMName).vhdx";
+
+    # Set the MAC Address of the Controller NIC
+    Hyper-V\Get-VMNetworkAdapter -VMName $VMName `
+        | WHERE {$_.SwitchName -ieq 'Controller'} `
+        | Set-VMNetworkAdapter -StaticMacAddress "00150a200802"
+
+    Hyper-V\get-vm -name $VMname | Start-VM;
+}
+
+# Remove the Template VHDX
+Remove-Item -LiteralPath 'D:\Temp\Template' -Recurse -Force;
+
+
+
+#############################################################
+# Configure the Beachhead Server
+# Run the following on Beachhead server (ssh)
+#############################################################
+# This beachhead server is based upon the template, so at first boot
+# it has the name and IP address of the template:  template/192.166.8.3.
+# The host-renaming script will kick in after 30 seconds.  Sit, wait, and be patient.
+# Proceed with a login after the system has rebooted
+# ssh into 192.166.8.2
+
+#   The beachhead server provides the following services:
+#      - DNS
+#      - Apt-Cache
+#
+#
+
+# Remove the apt-cache configuration for this particular VM
+sudo rm /etc/apt/apt.conf.d/00aptproxy
+
+#   Apt-Cache Installation Instructions:
+#      - https://www.atlantic.net/vps-hosting/how-to-set-up-apt-caching-server-using-apt-cacher-ng-on-ubuntu-20-04/
+sudo apt-get install apt-cacher-ng -y
+sudo sed -i "s/# PassThroughPattern: \.\*/PassThroughPattern: \.\*/"  /etc/apt-cacher-ng/acng.conf
+sudo systemctl enable apt-cacher-ng
+
+#
+#   DNS Server (Bind9) Installation Instructions:
+#      - https://www.linuxtips.fr/en/parental-control-using-a-safe-dns/
+#      - https://www.linuxtips.fr/en/define-a-local-dns-area/
+#      - https://www.linuxtips.fr/en/setting-up-a-dhcp-server-synced-with-dnd-debian-ubuntu/
+#
+sudo apt install bind9 -y
+sudo systemctl stop bind9
+
+# Helpful Bind Commands
+#    https://arstechnica.com/gadgets/2020/08/understanding-dns-anatomy-of-a-bind-zone-file/
+#    rndc freeze; <then make zone file changes>; rndc thaw
+#    sudo systemctl restart bind9
+
+
+# Create Bind Logging Directory
+#   https://nsrc.org/activities/agendas/en/dnssec-3-days/dns/materials/labs/en/dns-bind-logging.html
+sudo mkdir -p /var/log/bind
+sudo chown bind /var/log/bind
+
+# Update a bind9 configuration file
+sudo tee /etc/bind/named.conf.options<<EOF
+options {
+    directory "/var/cache/bind";
+
+    // If there is a firewall between you and nameservers you want
+    // to talk to, you may need to fix the firewall to allow multiple
+    // ports to talk.  See http://www.kb.cert.org/vuls/id/800113
+
+    // If your ISP provided one or more IP addresses for stable
+    // nameservers, you probably want to use them as forwarders.
+    // Uncomment the following block, and insert the addresses replacing
+    // the all-0's placeholder.
+
+    forwarders {
+            8.8.8.8;
+            8.8.4.4;
+    };
+
+    //========================================================================
+    // If BIND logs error messages about the root key being expired,
+    // you will need to update your keys.  See https://www.isc.org/bind-keys
+    //========================================================================
+    dnssec-validation auto;
+
+    listen-on-v6 { any; };
+};
+logging {
+        channel transfers {
+            file "/var/log/bind/transfers" versions 3 size 10M;
+            print-time yes;
+            severity info;
+        };
+        channel notify {
+            file "/var/log/bind/notify" versions 3 size 10M;
+            print-time yes;
+            severity info;
+        };
+        channel dnssec {
+            file "/var/log/bind/dnssec" versions 3 size 10M;
+            print-time yes;
+            severity info;
+        };
+        channel query {
+            file "/var/log/bind/query" versions 5 size 10M;
+            print-time yes;
+            severity info;
+        };
+        channel general {
+            file "/var/log/bind/general" versions 3 size 10M;
+        print-time yes;
+        severity info;
+        };
+    channel slog {
+        syslog security;
+        severity info;
+    };
+        category xfer-out { transfers; slog; };
+        category xfer-in { transfers; slog; };
+        category notify { notify; };
+
+        category lame-servers { general; };
+        category config { general; };
+        category default { general; };
+        category security { general; slog; };
+        category dnssec { dnssec; };
+
+        //category queries { query; };
+};
+EOF
+
+# Update AppArmor rules to allow writing to log files
+# Find this section:
+# 
+#   # /etc/bind should be read-only for bind
+#   # /var/lib/bind is for dynamically updated zone (and journal) files.
+#   # /var/cache/bind is for slave/stub data, since we're not the origin of it.
+#   # See /usr/share/doc/bind9/README.Debian.gz
+#   /etc/bind/** r,
+#   /var/lib/bind/** rw,
+#   /var/lib/bind/ rw,
+#   /var/cache/bind/** lrw,
+#   /var/cache/bind/ rw,
+# 
+# And, immediately after the last line in that block (/var/cache/bind/ rw,), add:
+# 
+#   /var/log/bind/** rw,
+#   /var/log/bind/ rw,
+#
+sudo systemctl restart apparmor
+
+# Define DNS Zones as external files
+sudo tee /etc/bind/named.conf.local<<EOF
+//
+// Do any local configuration here
+//
+
+// Consider adding the 1918 zones here, if they are not used in your
+// organization
+//include "/etc/bind/zones.rfc1918";
+
+controls {
+    inet 127.0.0.1 allow { localhost; };
+};
+
+zone "openstack.diy." {
+    type master;
+    file "/var/lib/bind/db.openstack.diy";
+    allow-update { 192.166.8.0/22; };
+};
+zone "ceph.diy." {
+    type master;
+    file "/var/lib/bind/db.ceph.diy";
+    allow-update { 192.166.4.0/22; };
+};
+zone "8.166.192.in-addr.arpa" {
+    type master;
+    file "/var/lib/bind/db.192.166.8.x";
+    allow-update { 192.166.8.0/22; };
+};
+zone "4.166.192.in-addr.arpa" {
+    type master;
+    file "/var/lib/bind/db.192.166.4.x";
+    allow-update { 192.166.4.0/22; };
+};
+EOF
+
+# Create the DNS Zone files
+# Forward lookup DNS
+sudo tee /var/lib/bind/db.openstack.diy<<'EOF'
+$ORIGIN openstack.diy.
+$TTL    60m
+;
+openstack.diy.   IN  SOA ns1.openstack.diy. MyUserAccount.MyDomain.com. (
+                                2004050105 ; serial
+                                10800      ; refresh (3 hours)
+                                3600       ; retry (1 hour)
+                                604800     ; expire (1 week)
+                                38400      ; minimum (10 hours 40 minutes)
+                                )
+                IN  NS  ns1.openstack.diy.
+				IN  NS  ns2.openstack.diy.
+				IN  A   192.166.8.2
+;
+beachhead               IN  A  192.166.8.2
+kolla                   IN  A  192.166.8.10
+kolla1                  IN  A  192.166.8.11
+kolla2                  IN  A  192.166.8.12
+kolla3                  IN  A  192.166.8.13
+ns1                     IN  A  192.166.8.2
+ns2                     IN  A  192.166.8.2
+template                IN  A  192.166.8.3
+EOF
+
+# Create the DNS Zone files
+# Forward lookup DNS
+sudo tee /var/lib/bind/db.ceph.diy<<'EOF'
+$ORIGIN ceph.diy.
+$TTL    60m
+;
+ceph.diy.        IN  SOA ns1.ceph.diy. MyUserAccount.MyDomain.com. (
+                                2004050105 ; serial
+                                10800      ; refresh (3 hours)
+                                3600       ; retry (1 hour)
+                                604800     ; expire (1 week)
+                                38400      ; minimum (10 hours 40 minutes)
+                                )
+                IN  NS  ns1.ceph.diy.
+				IN  NS  ns2.ceph.diy.
+				IN  A   192.166.8.2
+;
+kolla1                  IN  A  192.166.4.11
+kolla2                  IN  A  192.166.4.12
+kolla3                  IN  A  192.166.4.13
+ns1                     IN  A  192.166.8.2
+ns2                     IN  A  192.166.8.2
+EOF
+
+
+# Create Reverse lookup DNS
+sudo tee /var/lib/bind/db.192.166.8.x<<'EOF'
+$ORIGIN openstack.diy.
+$TTL 60m
+;
+8.166.192.in-addr.arpa.   IN SOA  ns1.openstack.diy. MyUserAccount.MyDomain.com. (
+                                2004050105 ; serial
+                                10800      ; refresh (3 hours)
+                                3600       ; retry (1 hour)
+                                604800     ; expire (1 week)
+                                38400      ; minimum (10 hours 40 minutes)
+                                )
+                        IN  NS  ns1.openstack.diy.
+;
+10                      PTR     kolla
+11                      PTR     kolla1
+12                      PTR     kolla2
+13                      PTR     kolla3
+2                       PTR     beachhead
+3                       PTR     template
+;
+EOF
+
+sudo tee /var/lib/bind/db.192.166.4.x<<'EOF'
+$ORIGIN ceph.diy.
+$TTL 60m
+;
+4.166.192.in-addr.arpa.   IN SOA  ns1.ceph.diy. MyUserAccount.MyDomain.com. (
+                                2004050105 ; serial
+                                10800      ; refresh (3 hours)
+                                3600       ; retry (1 hour)
+                                604800     ; expire (1 week)
+                                38400      ; minimum (10 hours 40 minutes)
+                                )
+                        IN  NS  ns1.ceph.diy.
+;
+11                      IN  PTR     kolla1
+12                      IN  PTR     kolla2
+13                      IN  PTR     kolla3
+EOF
+
+# Start the DHCP & DNS servers
+sudo systemctl restart bind9
+
+
+#############################################################
+# Take a snapshot of the beachhead VM
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "beachhead"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "beachhead"} | Checkpoint-VM -SnapshotName "DNS Configured";
+Hyper-V\get-vm | where {$_.name -imatch "beachhead"} | Start-VM;
+
+
+#############################################################
+# Create Three VMs in Hyper-V
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+$ErrorActionPreference = "Stop";
+$DefaultVMHostProperties = Hyper-V\Get-VMHost;
+
+$VMNames               = @("kolla1","kolla2","kolla3");
+$NetworkSwitch_Default = (Hyper-V\Get-VMSwitch -Name 'Controller').Name;
+$OSInstallDisk         = 'D:\MyUserAccount\Downloads\OS_Images\ubuntu-20:04.4-live-server-amd64.iso';
+$RamSize               = 2GB;
+$DiskSize              = 127GB;
+$VHDpath               = $DefaultVMHostProperties.VirtualHardDiskPath;
+$TemplateSnapshot      = "Netplan Updated and Host Renaming Script Installed";
+
+# Export the Template's VHDX
+Remove-Item -Recurse -LiteralPath 'D:\Temp\Template' -ErrorAction Ignore;
+Hyper-V\Export-VMSnapshot -VM (Hyper-V\get-vm -Name "Ubuntu 20.04LTS Template") `
+                    -Name $TemplateSnapshot `
+                    -Path D:\Temp\Template;
+
+ForEach ($VMName in $VMNames) {
+    # Remove previous VM
+    Try {
+        $VM = Hyper-V\Get-VM -Name $VMName;
+        $VM | Hyper-V\Stop-VM -TurnOff -Force;
+        $VM | Hyper-V\Remove-VMSnapshot -IncludeAllChildSnapshots;
+        $VM.HardDrives.Path | Remove-Item -Force -ErrorAction Ignore;
+        $VM | Hyper-V\Remove-VM -Force;
+    }
+    Catch {
+        $Error.Clear();
+    }
+
+    # Remove any lingering hard drives
+    Get-ChildItem -Path D:\Hyper-V -Filter "$($VMName)*" | Remove-Item -Force -ErrorAction Ignore;
+
+    Remove-Variable VM -ErrorAction SilentlyContinue;
+
+    $VM = Hyper-V\New-VM `
+                    -Name                      $VMName `
+                    -MemoryStartupBytes        $RamSize `
+                    -Generation                1 `
+                    -NewVHDSizeBytes           $DiskSize `
+                    -NewVHDPath                ((Join-Path $VHDpath $VMName) + ".vhdx") `
+                    -SwitchName                $NetworkSwitch_Default;
+
+    $VM | Hyper-V\Set-VMProcessor -Count 2 -ExposeVirtualizationExtensions $false;
+    $VM | Set-VMBios -EnableNumLock;
+    $VM | Set-VMMemory -DynamicMemoryEnabled $true -StartupBytes $RamSize;
+    $VM | Set-VM -AutomaticCheckpointsEnabled $false;
+    $VM | Add-VMNetworkAdapter -SwitchName Controller;
+	$VM | Add-VMNetworkAdapter -SwitchName Storage;
+    $VM.NetworkAdapters | Set-VMNetworkAdapter -MacAddressSpoofing On;
+    
+    # Remove the hard disk that was created.
+    Remove-Item -LiteralPath "$(Join-Path $VHDpath $VMName).vhdx" -Force;
+
+    # Copy and rename the Template VHDX into this VM
+    Copy-Item -LiteralPath 'D:\Temp\Template\Ubuntu 20.04LTS Template\Virtual Hard Disks\Ubuntu 20.04LTS Template.vhdx' `
+            -Destination "$(Join-Path $VHDpath $VMName).vhdx";
+            
+    # Add Additional Disks
+    $VHD = New-VHD -path ((Join-Path $VHDpath $VMName) + "_scsi1.vhdx") `
+                   -SizeBytes 10GB `
+                   -Dynamic;
+    Add-VMHardDiskDrive -Path $VHD.Path -VMname $VMName -ControllerType SCSI -ControllerNumber 0;
+
+    $VHD = New-VHD -path ((Join-Path $VHDpath $VMName) + "_scsi2.vhdx") `
+                   -SizeBytes 20GB `
+                   -Dynamic;
+    Add-VMHardDiskDrive -Path $VHD.Path -VMname $VMName -ControllerType SCSI -ControllerNumber 0;
+}
+
+# Remove the Template VHDX
+Remove-Item -LiteralPath 'D:\Temp\Template' -Recurse -Force;    
+
+# Set the Primary NIC's MAC address
+# By pinning a MAC to a NIC, they are always guaranteed to get the same IP address from the NetPlan file.
+
+# Kolla1, eth0
+Hyper-V\Get-VMNetworkAdapter -VMName "kolla1" `
+    | WHERE {$_.SwitchName -ieq 'Controller'} `
+	| SELECT -first 1 `
+    | Set-VMNetworkAdapter -StaticMacAddress "00150a20080b"
+
+# Kolla1, eth2
+Hyper-V\Get-VMNetworkAdapter -VMName "kolla1" `
+    | WHERE {$_.SwitchName -ieq 'Storage'} `
+    | Set-VMNetworkAdapter -StaticMacAddress "00150a20040b"
+	
+	
+# Kolla2, eth0
+Hyper-V\Get-VMNetworkAdapter -VMName "kolla2" `
+    | WHERE {$_.SwitchName -ieq 'Controller'} `
+	| SELECT -first 1 `
+    | Set-VMNetworkAdapter -StaticMacAddress "00150a20080c"
+
+# Kolla2, eth2
+Hyper-V\Get-VMNetworkAdapter -VMName "kolla2" `
+    | WHERE {$_.SwitchName -ieq 'Storage'} `
+    | Set-VMNetworkAdapter -StaticMacAddress "00150a20040c"
+
+
+# Kolla3, eth0
+Hyper-V\Get-VMNetworkAdapter -VMName "kolla3" `
+    | WHERE {$_.SwitchName -ieq 'Controller'} `
+	| SELECT -first 1 `
+    | Set-VMNetworkAdapter -StaticMacAddress "00150a20080d"
+
+# Kolla3, eth2
+Hyper-V\Get-VMNetworkAdapter -VMName "kolla3" `
+    | WHERE {$_.SwitchName -ieq 'Storage'} `
+    | Set-VMNetworkAdapter -StaticMacAddress "00150a20040d"
+
+
+# Snapshot then Start the VMs
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Start-VM;
+# Wait for VM to rename itself
+start-sleep -seconds 90;
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Checkpoint-VM -SnapshotName "Fresh Clone";
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Start-VM;
+
+
+#############################################################
+# Configure your Putty application
+# Run the following on your Hyper-V host
+#############################################################
+#Edit your Putty settings for all three kolla VM profiles
+#  Session > Load, Save, or delete a stored session > Load
+#  Category > Connection > SSH > Auth > Private Key File for Authentication:  C:\Users\MyUserAccount\.ssh\id_ed25519.ppk
+#  Category > Terminal > Features > Disable application keypad mode > Checked
+#  Session > Load, Save, or delete a stored session > Save
+#  Connect
+
+
+
+#############################################################
+# Prepare the beachhead
+# Run the following on beachhead (ssh)
+#############################################################
+# Prime the "sudo" pump
+sudo ls
+
+# Set the FQDN
+sudo hostnamectl set-hostname beachhead.openstack.diy
+
+# Allow SUDO without password
+echo "`whoami`  ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/`whoami`
+
+# Make your local account aware of the SSH keys on the other VMs
+ssh-keyscan -H 192.166.8.11           >> ~/.ssh/known_hosts
+ssh-keyscan -H 192.166.8.12           >> ~/.ssh/known_hosts
+ssh-keyscan -H 192.166.8.13           >> ~/.ssh/known_hosts
+ssh-keyscan -H kolla1                 >> ~/.ssh/known_hosts
+ssh-keyscan -H kolla2                 >> ~/.ssh/known_hosts
+ssh-keyscan -H kolla3                 >> ~/.ssh/known_hosts
+ssh-keyscan -H kolla1.openstack.diy    >> ~/.ssh/known_hosts
+ssh-keyscan -H kolla2.openstack.diy    >> ~/.ssh/known_hosts
+ssh-keyscan -H kolla3.openstack.diy    >> ~/.ssh/known_hosts
+sort ~/.ssh/known_hosts | uniq > ~/.ssh/known_hosts.unique
+mv  ~/.ssh/known_hosts.unique ~/.ssh/known_hosts
+
+# Make local root account aware of the SSH keys on the other VMs
+ssh-keyscan -H 192.166.8.11           | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H 192.166.8.12           | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H 192.166.8.13           | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H kolla1                 | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H kolla2                 | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H kolla3                 | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H kolla1.openstack.diy   | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H kolla2.openstack.diy   | sudo tee -a /root/.ssh/known_hosts
+ssh-keyscan -H kolla3.openstack.diy   | sudo tee -a /root/.ssh/known_hosts
+sudo sort /root/.ssh/known_hosts | uniq | sudo tee /root/.ssh/known_hosts.unique
+sudo mv /root/.ssh/known_hosts.unique /root/.ssh/known_hosts
+
+# Generate an SSH Keypair for local root.  No passphrase.
+sudo ssh-keygen -t ed25519 -q -N "" -f /root/.ssh/id_ed25519
+
+
+
+#############################################################
+# Prepare your account's security access on Kolla nodes
+# Run the following on beachhead (ssh)
+#############################################################
+~/tmux-into-KAO-nodes.sh kolla1 kolla2 kolla3
+# At this point tmux will open a new session with three windows
+# tmux tips:  https://danielmiessler.com/study/tmux/
+
+# Allow SUDO without password
+echo "`whoami`  ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/`whoami`
+
+# Create a security group for administrators
+GRP=openstack_admins
+sudo groupadd $GRP
+sudo usermod -a -G $GRP `whoami`
+
+# Exit tmux back to MyUserAccount@beachhead
+exit
+
+# Test passwordless sudo on Kolla nodes.
+# Each should return a list of files
+ssh `whoami`@kolla1.openstack.diy sudo ls -al /root/.ssh
+ssh `whoami`@kolla2.openstack.diy sudo ls -al /root/.ssh
+ssh `whoami`@kolla3.openstack.diy sudo ls -al /root/.ssh
+
+# Install Beachhead's root's SSH keypair on the other nodes (kolla1 kolla2 kolla3)
+sudo cp /root/.ssh/id_ed25519     ~/
+sudo cp /root/.ssh/id_ed25519.pub ~/
+sudo chown `whoami` ~/id_ed25519*
+Nodes="kolla1 kolla2 kolla3"
+for node in $Nodes;
+do 
+	# Add FQDN to host name
+	node="${node}.openstack.diy"
+	
+    # Copy the SSH keypair into node's temp directory
+    scp ~/id_ed* `whoami`@${node}:/tmp
+	
+	# Copy the SSH keypair into node's root's .ssh directory
+	ssh `whoami`@${node} sudo cp /tmp/id_ed25519 /root/.ssh 
+    ssh `whoami`@${node} "sudo cat /tmp/id_ed25519.pub | sed 's/beachhead/`hostname`/'| sudo tee -a /root/.ssh/id_ed25519.pub"
+	ssh `whoami`@${node} sudo chown root /root/.ssh/id_ed25519
+    ssh `whoami`@${node} sudo chgrp root /root/.ssh/id_ed25519
+    ssh `whoami`@${node} sudo chgrp root /root/.ssh/id_ed25519.pub
+    ssh `whoami`@${node} sudo chown root /root/.ssh/id_ed25519.pub
+	
+	# Add the key to root's Authorized_Keys
+	ssh `whoami`@${node} "sudo cat /tmp/id_ed25519.pub | sudo tee -a /root/.ssh/authorized_keys"
+	ssh `whoami`@${node} "sudo cat /tmp/id_ed25519.pub | sed 's/beachhead/kolla1/'| sudo tee -a /root/.ssh/authorized_keys"
+	ssh `whoami`@${node} "sudo cat /tmp/id_ed25519.pub | sed 's/beachhead/kolla2/'| sudo tee -a /root/.ssh/authorized_keys"
+	ssh `whoami`@${node} "sudo cat /tmp/id_ed25519.pub | sed 's/beachhead/kolla3/'| sudo tee -a /root/.ssh/authorized_keys"
+	
+	# Add keys of other hosts to known_hosts file
+	ssh `whoami`@${node} "ssh-keyscan -H 192.166.8.11          | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H 192.166.8.12          | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H 192.166.8.13          | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H kolla1                | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H kolla2                | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H kolla3                | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H kolla1.openstack.diy  | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H kolla2.openstack.diy  | sudo tee -a /root/.ssh/known_hosts"
+	ssh `whoami`@${node} "ssh-keyscan -H kolla3.openstack.diy  | sudo tee -a /root/.ssh/known_hosts"
+done
+rm ~/id_ed25519*
+
+# Test SSH-key login with root account
+sudo su
+./tmux-into-KAO-nodes.sh kolla1 kolla2 kolla3
+# You should see three new sessions on screen.
+# If you don't, then something went wrong.
+
+# Exit tmux, back to root@beachhead
+exit
+
+# Exit root, back to MyUserAccount@beachhead
+exit
+
+
+
+#############################################################
+# Take a snapshot of the Kolla nodes
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Checkpoint-VM -SnapshotName "Credentials Installed";
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Start-VM;
+
+
+
+#############################################################
+# Install the Ceph Cluster
+# Run the following on beachhead (ssh)
+#############################################################
+
+# Create Python Virtual Environment for Kolla
+sudo apt install -y python3 python3-venv python3-dev libffi-dev gcc libssl-dev python-is-python3 python3-setuptools python3-pip
+GRP=openstack_admins
+sudo mkdir -p     /usr/local/kolla_venv
+sudo chgrp $GRP   /usr/local/kolla_venv
+sudo chmod g+rwx  /usr/local/kolla_venv
+python3 -m venv   /usr/local/kolla_venv
+cd                /usr/local/kolla_venv
+source /usr/local/kolla_venv/bin/activate
+
+# Install Prerequisites for both OpenStack
+# Docker is being installed by pip.  Can ceph access Docker?  No.
+pip install -U pip
+pip install wheel
+pip install 'ansible>=4,<6'
+#pip install docker
+
+# Create Kolla Directory
+sudo mkdir -p /etc/kolla
+sudo chgrp $GRP /etc/kolla
+sudo chmod g+rwx /etc/kolla
+
+# https://releases.openstack.org/teams/kolla.html#yoga
+KOLLA_BRANCH=yoga
+KOLLA_OPENSTACK_VERSION=14.3.0
+
+pip install git+https://opendev.org/openstack/kolla-ansible@stable/$KOLLA_BRANCH
+pip install python-openstackclient -c https://releases.openstack.org/constraints/upper/$KOLLA_BRANCH
+
+# Copy in Kolla Configuration Files
+sudo chgrp $GRP /etc/kolla
+cp -r /usr/local/kolla_venv/share/kolla-ansible/etc_examples/kolla/* /etc/kolla
+sudo chgrp $GRP /etc/kolla/globals.yml
+sudo chgrp $GRP /etc/kolla/passwords.yml
+
+# Copy in Kolla Deployment Files
+cp /usr/local/kolla_venv/share/kolla-ansible/ansible/inventory/* .
+
+# Update Kolla Deployment Files to specify Python3
+#printf "localhost ansible_python_interpreter=python3\n$(</usr/local/kolla_venv/multinode)" > /usr/local/kolla_venv/multinode
+
+# Install Ansible Galaxy requirements
+kolla-ansible install-deps
+
+# Set Ansible Defaults
+sudo mkdir /etc/ansible
+sudo chgrp $GRP /etc/ansible
+sudo chmod g+rwx /etc/ansible
+sudo tee /etc/ansible/ansible.cfg <<-EOF
+    [defaults]
+    host_key_checking=False
+    pipelining=True
+    forks=100
+    deprecation_warnings=False
+EOF
+sudo chgrp $GRP /etc/ansible/ansible.cfg
+sudo chmod g+rwx /etc/ansible/ansible.cfg
+
+# Update Kolla Configuration File 'multinode'
+# Rename the control nodes to use kolla# host names
+sed -i '/^control01/c\kolla1.openstack.diy'  /usr/local/kolla_venv/multinode
+sed -i '/^control02/c\kolla2.openstack.diy'  /usr/local/kolla_venv/multinode
+sed -i '/^control03/c\kolla3.openstack.diy'  /usr/local/kolla_venv/multinode
+
+# Point all network children back to the control nodes
+sed -i '/^\[network\]/c\[network:children\]'   /usr/local/kolla_venv/multinode
+sed -i '/^network01/c\control'                 /usr/local/kolla_venv/multinode
+sed -i '/^network02/d'                         /usr/local/kolla_venv/multinode
+
+# Point all compute children back to the control nodes
+sed -i '/^\[compute\]/c\[compute:children\]'   /usr/local/kolla_venv/multinode
+sed -i '/^compute01/c\control'                 /usr/local/kolla_venv/multinode
+
+# Point all monitoring children back to the control nodes
+sed -i '/^monitoring01/c\kolla1.openstack.diy'  /usr/local/kolla_venv/multinode
+
+# Point all storage children back to the control nodes
+sed -i '/^\[storage\]/c\[storage:children\]'   /usr/local/kolla_venv/multinode
+sed -i '/^storage01/c\control'                 /usr/local/kolla_venv/multinode
+
+# Test Ping Hosts Through Ansible
+ansible -i /usr/local/kolla_venv/multinode all -m ping
+
+# The result should look like this:
+# localhost | SUCCESS => {
+#     "changed": false,
+#     "ping": "pong"
+# }
+# kolla1 | SUCCESS => {
+#     "ansible_facts": {
+#         "discovered_interpreter_python": "/usr/bin/python3"
+#     },
+#     "changed": false,
+#     "ping": "pong"
+# }
+# kolla2 | SUCCESS => {
+#     "ansible_facts": {
+#         "discovered_interpreter_python": "/usr/bin/python3"
+#     },
+#     "changed": false,
+#     "ping": "pong"
+# }
+# kolla3 | SUCCESS => {
+#     "ansible_facts": {
+#         "discovered_interpreter_python": "/usr/bin/python3"
+#     },
+#     "changed": false,
+#     "ping": "pong"
+# }
+
+# Update Kolla's Global Configuration File
+sed -i '/#kolla_base_distro: "centos"/c\kolla_base_distro: "ubuntu"'    /etc/kolla/globals.yml
+sed -i '/#openstack_release: "yoga"/c\openstack_release: "yoga"'        /etc/kolla/globals.yml
+sed -i '/#kolla_install_type: "source"/c\kolla_install_type: "source"'  /etc/kolla/globals.yml
+
+# https://docs.openstack.org/kolla/newton/advanced-configuration.html
+# VIP Configuration (Internal)
+sed -i '/#kolla_internal_vip_address: "10.10.10.254"/c\kolla_internal_vip_address: "192.166.8.10"'  /etc/kolla/globals.yml
+sed -i '/#network_interface: "eth0"/c\network_interface: "eth0"'                                  /etc/kolla/globals.yml
+
+# VIP Configuration (External)
+#sed -i '/#kolla_external_vip_address: "{{ kolla_internal_vip_address }}"/c\kolla_external_vip_address: "192.168.201.5"'  /etc/kolla/globals.yml
+#sed -i '/#kolla_external_vip_interface: "{{ network_interface }}"/c\kolla_external_vip_interface: "eth2"'                /etc/kolla/globals.yml
+
+# Neutron Configuration
+sed -i '/#neutron_external_interface: "eth1"/c\neutron_external_interface: "eth2"'  /etc/kolla/globals.yml
+
+sed -i '/#kolla_internal_fqdn: "{{ kolla_internal_vip_address }}"/c\kolla_internal_fqdn: "kolla.openstack.diy"'    /etc/kolla/globals.yml
+sed -i '/#enable_haproxy: "yes"/c\enable_haproxy: "yes"'                                                          /etc/kolla/globals.yml
+sed -i '/#nova_compute_virt_type: "kvm"/c\nova_compute_virt_type: "kvm"'                                          /etc/kolla/globals.yml
+
+# Enable OpenStack Services:  Cinder, Cinder_Backup, 
+sed -i '/#enable_cinder: "no"/c\enable_cinder: "yes"'                                                             /etc/kolla/globals.yml
+sed -i '/#enable_cinder_backup: "yes"/c\enable_cinder_backup: "yes"'                                              /etc/kolla/globals.yml
+
+# Tell OpenStack (Glance) to use Ceph
+sed -i '/#glance_backend_ceph: "no"/c\glance_backend_ceph: "yes"'                                                 /etc/kolla/globals.yml
+sed -i '/#ceph_glance_keyring: "ceph.client.glance.keyring"/c\ceph_glance_keyring: "ceph.client.glance.keyring"'  /etc/kolla/globals.yml
+sed -i '/#ceph_glance_user: "glance"/c\ceph_glance_user: "glance"'                                                /etc/kolla/globals.yml
+sed -i '/#ceph_glance_pool_name: "images"/c\ceph_glance_pool_name: "images"'                                      /etc/kolla/globals.yml
+
+# Tell OpenStack (Cinder) to use Ceph
+# Tell OpenStack (Nova) to use OpenStack (Cinder) volumes
+sed -i '/#cinder_backend_ceph: "no"/c\cinder_backend_ceph: "yes"'                                                                      /etc/kolla/globals.yml
+sed -i '/#ceph_cinder_keyring: "ceph.client.cinder.keyring"/c\ceph_cinder_keyring: "ceph.client.cinder.keyring"'                       /etc/kolla/globals.yml
+sed -i '/#ceph_cinder_user: "cinder"/c\ceph_cinder_user: "cinder"'                                                                     /etc/kolla/globals.yml
+sed -i '/#ceph_cinder_pool_name: "volumes"/c\ceph_cinder_pool_name: "volumes"'                                                         /etc/kolla/globals.yml
+sed -i '/#ceph_cinder_backup_keyring: "ceph.client.cinder.keyring"/c\ceph_cinder_backup_keyring: "ceph.client.cinder-backup.keyring"'  /etc/kolla/globals.yml
+sed -i '/#ceph_cinder_backup_user: "cinder-backup"/c\ceph_cinder_backukp_user: "cinder-backup"'                                        /etc/kolla/globals.yml
+sed -i '/#ceph_cinder_backup_pool_name: "backups"/c\ceph_cinder_backup_pool_name: "backups"'                                           /etc/kolla/globals.yml
+
+# Tell OpenStack (Nova) to use Ceph (Ephermeral Disks)
+sed -i '/#nova_backend_ceph: "no"/c\nova_backend_ceph: "yes"'                                               /etc/kolla/globals.yml
+sed -i '/#ceph_nova_keyring: "{{ ceph_cinder_keyring }}"/c\ceph_nova_keyring: "{{ ceph_cinder_keyring }}"'  /etc/kolla/globals.yml
+sed -i '/#ceph_nova_user: "nova"/c\ceph_nova_user: "{{ ceph_cinder_user }}"'                                /etc/kolla/globals.yml
+sed -i '/#ceph_nova_pool_name: "vms"/c\ceph_nova_pool_name: "vms"'                                          /etc/kolla/globals.yml
+sed -i '/#nova_compute_virt_type: "kvm"/c\nova_compute_virt_type: "qemu"'                                   /etc/kolla/globals.yml
+
+kolla-genpwd
+
+
+#############################################################
+# Take a snapshot of the Kolla nodes + Beachhead
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "beachhead"}    | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "beachhead"}    | Checkpoint-VM -SnapshotName "Ready to Bootstrap";
+Hyper-V\get-vm | where {$_.name -imatch "beachhead"}    | Start-VM;
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Checkpoint-VM -SnapshotName "Ready to Bootstrap";
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Start-VM;
+
+
+#############################################################
+# OpenStack Bootstrap
+# Run the following on Beachhead via SSH
+#############################################################
+ssh MyUserAccount@kolla1.openstack.diy sudo ip link set eth1 up && \
+ssh MyUserAccount@kolla2.openstack.diy sudo ip link set eth1 up && \
+ssh MyUserAccount@kolla3.openstack.diy sudo ip link set eth1 up
+
+# This installs prerequisites, including Docker.  
+# Docker is used by both Kolla Ansible OpenStack and Ceph.
+kolla-ansible -i /usr/local/kolla_venv/multinode bootstrap-servers
+
+# After the bootstrap (above) completes, the OS of each node requests a reboot
+Nodes="kolla1 kolla2 kolla3"
+for node in $Nodes;
+do 
+	# Add FQDN to host name
+	node="${node}.openstack.diy"
+	
+    # Issue the reboot
+	ssh `whoami`@${node} sudo reboot
+done
+
+
+
+#############################################################
+# Take a snapshot of the Kolla nodes
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Checkpoint-VM -SnapshotName "OpenStack Bootstrap Completed";
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Start-VM;
+
+
+#############################################################
+# Prepare the Kolla Nodes for the Ceph Cluster Software
+# Run the following on beachhead (ssh)
+#############################################################
+sudo su
+~/tmux-into-KAO-nodes.sh kolla1 kolla2 kolla3
+# At this point tmux will open a new session with three windows
+# tmux tips:  https://danielmiessler.com/study/tmux/
+
+ip link set eth1 up
+
+# Ready to install Ceph
+# https://docs.ceph.com/en/latest/cephadm/install/
+# NOTE:  Some of the official documentation calls out the need for a "cephadm user" with 
+#        password-less root privileges.  Not sure how best to accomplish this and stay secure.
+#        https://access.redhat.com/documentation/en-us/red_hat_ceph_storage/5/html/data_security_and_hardening_guide/assembly-encryption-and-key-management
+
+# Install Ceph using the Curl method.
+# OpenStack Yoga requires the Quincy version of Ceph.
+# Ubuntu 20:04 LTS can only pull the Octopus version of Ceph (2 versions behind Quincy)
+# https://www.youtube.com/watch?v=ENsfa8WB6EI
+#   NOTE:  Don't follow the instructions to configure docker from this video
+#          https://forums.docker.com/t/cant-install-docker-on-ubuntu-20-04/93058/3
+curl --silent --remote-name --location https://github.com/ceph/ceph/raw/quincy/src/cephadm/cephadm
+chmod +x cephadm
+
+# These commands install the latest version, which at the time of this writing is 17.2.2.
+# 17.2.2 is not a stable version according to the web site: https://docs.ceph.com/en/quincy/releases/index.html
+#   sudo ./cephadm add-repo --release quincy
+#   sudo ./cephadm install
+
+sudo ./cephadm add-repo --version 17.1.0
+sudo ./cephadm install
+# Notes About Installation:
+# Using version "17.2.0" does not appear to have worked.  The web ui still shows version 17.2.2.  Poop.
+# Using version "17.1.0" kind of worked.  It actually installed v17.0.0.
+#     v17.0.0 is way slower than 17.2.2 in the GUI and deploying services.
+# https://www.reddit.com/r/ceph/comments/w5ecby/failed_upgrade_from_1720_to_1722_ceph_mgr_daemons/
+
+sudo apt update
+sudo apt install -y ceph-base=17.1.0-1focal ceph-common=17.1.0-1focal
+
+# Exit out of tmux, back to root@beachhead
+exit
+
+
+
+#############################################################
+# Take a snapshot of the Kolla nodes
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Stop-VM;
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Checkpoint-VM -SnapshotName "Ceph Prerequisites Installed";
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Start-VM;
+
+
+
+#############################################################
+# Ensure Neutron NICs are UP
+# Run the following on beachhead (ssh)
+#############################################################
+ssh MyUserAccount@kolla1.openstack.diy sudo ip link set eth1 up && \
+ssh MyUserAccount@kolla2.openstack.diy sudo ip link set eth1 up && \
+ssh MyUserAccount@kolla3.openstack.diy sudo ip link set eth1 up
+
+
+
+#############################################################
+# Install the Ceph Cluster
+# Run the following on beachhead (ssh)
+#############################################################
+sudo su
+~/tmux-into-KAO-nodes.sh kolla1
+/root/cephadm bootstrap --mon-ip `dig +short kolla1.ceph.diy` --cluster-network 192.166.4.0/22 --initial-dashboard-user admin --initial-dashboard-password InitialPassword!
+# When the install completes, it generates something like this:
+# Ceph Dashboard is now available at:
+# 
+#              URL: https://kolla1.openstack.diy:8443/
+#             User: admin
+#         Password: InitialPassword!
+# 
+# Enabling client.admin keyring and conf on hosts with "admin" label
+# Saving cluster configuration to /var/lib/ceph/b4dab882-0bae-11ed-9548-c343c34449ba/config directory
+# Enabling autotune for osd_memory_target
+# You can access the Ceph CLI as following in case of multi-cluster or non-default config:
+# 
+#         sudo /usr/sbin/cephadm shell --fsid ed53260c-0c96-11ed-8254-a56b993979eb -c /etc/ceph/ceph.conf -k /etc/ceph/ceph.client.admin.keyring
+# 
+# 
+# Create a new DSSC (Delinea/Thycotic) entry for Ceph and insert this entry from above:
+#     sudo /usr/sbin/cephadm shell --fsid ed53260c-0c96-11ed-8254-a56b993979eb -c /etc/ceph/ceph.conf -k /etc/ceph/ceph.client.admin.keyring
+#
+# Also, the installation process has created a new public certificate located here:
+#    /etc/ceph/ceph.pub
+#
+
+# Install the ceph cluster’s public SSH key into the new host’s user’s authorized_keys file
+# Is Passwordless Sudo enabled?
+#       YES
+Nodes="kolla1 kolla2 kolla3"
+for node in $Nodes;
+do 
+	# Add FQDN to host name
+	node="${node}.openstack.diy"
+	
+	cat /etc/ceph/ceph.pub | \
+	  ssh `whoami`@${node} \
+	  "sudo tee -a /root/.ssh/authorized_keys"
+done
+#
+#       NO
+#           Instructions Here...
+#
+
+# Kolla1 doesn't have these labels, so we add them
+cephadm shell -- ceph orch host label add kolla1 mgr && \
+cephadm shell -- ceph orch host label add kolla1 mon && \
+cephadm shell -- ceph orch host label add kolla1 osd
+
+# Configure Ceph for Hyperconverged Infrastructure
+# Process one at a time.  Each command takes a while to execute and they don't stack well in bash.
+cephadm shell -- ceph config set osd osd_memory_target_autotune false && \
+cephadm shell -- ceph config set osd osd_numa_auto_affinity = true && \
+cephadm shell -- ceph config set mgr mgr/cephadm/autotune_memory_target_ratio 0.2
+# These don't appear to work.  At least, they don't show up in the Cluster Configuration web page.
+
+
+# Add kolla2 & kolla3 to the cluster
+# GUI Method: https://192.166.8.11:8443/#/expand-cluster
+# Add Hosts > + Add 
+#    Hostname:         kolla2       <-- Don't use FQDN
+#    Network Address:  192.166.4.12
+#    Labels:           _admin, mon, mgr, osd
+cephadm shell -- ceph orch host add kolla2 192.166.4.12 _admin mgr mon osd && \
+cephadm shell -- ceph orch host add kolla3 192.166.4.13 _admin mgr mon osd
+
+
+tee /etc/ceph/cluster_configuration.yml <<-'EOF'
+	service_type: mon
+	placement:
+	  count: 3
+	  label: mon
+	---
+	service_type: mgr
+	placement:
+	  count: 3
+	  label: mgr
+EOF
+ceph orch apply -i /etc/ceph/cluster_configuration.yml
+
+# Configure Ceph to auto-import all disks on all hosts and use encryption (at-rest)
+#  https://docs.ceph.com/en/octopus/cephadm/drivegroups/
+# NOTE: "service_id" shows up as "osdspec_affinity" in the OSD's metadata
+# NOTE: It is recommended that "osds_per_device" = 2 for any NVME drives, but there isn't a flag for ssd vs nvme.
+sudo tee /etc/ceph/osd_deployment_options.yml <<-'EOF'
+	service_type: osd
+	service_id: osd_spec_hdd
+	placement:
+	  host_pattern: '*'
+	data_devices:
+	  rotational: 1
+	encrypted: true
+	osds_per_device: 1
+	---
+	service_type: osd
+	service_id: osd_spec_sata_sas_nvme_ssd
+	placement:
+	  host_pattern: '*'
+	data_devices:
+	  rotational: 0
+	encrypted: true
+	osds_per_device: 1
+EOF
+ceph orch apply osd -i /etc/ceph/osd_deployment_options.yml
+
+# I believe this will auto-import all disks forever unless you turn it off with this command:
+#  sudo ceph orch apply osd --all-available-devices --unmanaged=true
+
+# Wait for Ceph to catch up.  It may take several minutes before the configuration changes (above) are totally processed.
+
+# List all available storage devices
+cephadm shell -- ceph orch device ls
+# Don't pay attention to these errors.  They have since been solved.  Now this only stands as an example of the output of this command.
+#  HOST    PATH      TYPE  DEVICE ID                                       SIZE  AVAILABLE  REFRESHED  REJECT REASONS
+#  kolla1  /dev/fd0  hdd                                                  4096              4s ago     Failed to determine if device is BlueStore, Insufficient space (<5GB), locked
+#  kolla1  /dev/sdb  hdd   Virtual_Disk_60022480b2864e64ac14396843ad4d10  10.7G             4s ago     Insufficient space (<10 extents) on vgs, LVM detected, locked
+#  kolla1  /dev/sdc  hdd   Virtual_Disk_600224805d2ce6072b5a865ededb8008  21.4G  Yes        4s ago
+#  kolla2  /dev/fd0  hdd                                                  4096              2m ago     Failed to determine if device is BlueStore, Insufficient space (<5GB), locked
+#  kolla2  /dev/sda  hdd   Virtual_Disk_600224808dc60bf74226def51963c6de  10.7G  Yes        2m ago
+#  kolla2  /dev/sdb  hdd   Virtual_Disk_60022480f00859a4aff042f842ab1318  21.4G  Yes        2m ago
+#  kolla3  /dev/fd0  hdd                                                  4096              2m ago     Failed to determine if device is BlueStore, Insufficient space (<5GB), locked
+#  kolla3  /dev/sdb  hdd   Virtual_Disk_60022480ec160aa388697a2bef4128d7  10.7G  Yes        2m ago
+#  kolla3  /dev/sdc  hdd   Virtual_Disk_60022480da38d8b7757060873c3af4ee  21.4G  Yes        2m ago
+
+# Create Crush Rule for data anti-affinity
+# TBD
+
+# Create Ceph Pools
+# https://docs.openstack.org/kolla-ansible/yoga/reference/storage/external-ceph-guide.html
+# https://docs.ceph.com/en/latest/rbd/rbd-openstack/
+cephadm shell -- ceph osd pool create volumes && \
+cephadm shell -- ceph osd pool create images && \
+cephadm shell -- ceph osd pool create backups && \
+cephadm shell -- ceph osd pool create vms && \
+cephadm shell -- rbd pool init volumes && \
+cephadm shell -- rbd pool init images && \
+cephadm shell -- rbd pool init backups && \
+cephadm shell -- rbd pool init vms
+
+
+# Create a new users for OpenStack
+ceph auth get-or-create client.glance        mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=images'                         -o /etc/ceph/ceph.client.glance.keyring
+ceph auth get-or-create client.cinder        mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=volumes, allow rwx pool=images' -o /etc/ceph/ceph.client.cinder.keyring
+ceph auth get-or-create client.cinder-backup mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=backups'                        -o /etc/ceph/ceph.client.cinder-backup.keyring 
+ceph auth get-or-create client.nova          mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=vms, allow rx pool=images'      -o /etc/ceph/ceph.client.nova.keyring
+
+# NOTE:  Here is a different version from 'OpenStack Kolla Ansible NultiNode v3.txt'
+# ceph auth get-or-create client.glance        mon 'profile rbd' osd 'profile rbd pool=images'                                                           mgr 'profile rbd pool=images'
+# ceph auth get-or-create client.cinder        mon 'profile rbd' osd 'profile rbd pool=volumes, profile rbd pool=vms, profile rbd-read-only pool=images' mgr 'profile rbd pool=volumes, profile rbd pool=vms'
+# ceph auth get-or-create client.cinder-backup mon 'profile rbd' osd 'profile rbd pool=backups'                                                          mgr 'profile rbd pool=backups'
+
+# Exit out of tmux on kolla1 back to root@beachhead
+exit
+
+# Exit out of root@beachhead back to MyUserAccount@beachhead
+exit
+
+# Keep a web browser open to https://kolla1.ceph.diy:8443/#/dashboard
+#  In the past, this web site has dropped out while OpenStack boostrap was running
+
+
+
+#############################################################
+# Import the Ceph Cluster's Configuration Files to Beachhead
+# Run the following on beachhead (ssh)
+#############################################################
+
+# Import and clean up the Ceph Cluster's Configuration Files
+scp `whoami`@kolla1.openstack.diy:/etc/ceph/ceph.* /tmp
+# Pull out any leading whitespace.  Oslo iniparser.py will throw the error 'error_unexpected_continuation'
+#  because whitespace a the start of a line is a "Continuation of previous assignment".
+# https://github.com/openstack/oslo.config/blob/master/oslo_config/iniparser.py
+sudo sed -i -e 's/^[ \t]*//' /tmp/ceph.conf
+
+# Build Directory Structure on Beachhead
+sudo mkdir -p /etc/kolla/config
+sudo mkdir -p /etc/kolla/config/nova
+sudo mkdir -p /etc/kolla/config/glance
+sudo mkdir -p /etc/kolla/config/cinder/cinder-volume
+sudo mkdir -p /etc/kolla/config/cinder/cinder-backup
+
+# Push Ceph Config Files into local directory structure
+# The Kolla Ansible deploy process will read these files and push them out to the OpenStack nodes
+sudo scp /tmp/ceph.conf                         /etc/kolla/config/cinder/
+sudo scp /tmp/ceph.conf                         /etc/kolla/config/nova/
+sudo scp /tmp/ceph.conf                         /etc/kolla/config/glance/
+sudo scp /tmp/ceph.client.glance.keyring        /etc/kolla/config/glance/
+sudo scp /tmp/ceph.client.nova.keyring          /etc/kolla/config/nova/
+sudo scp /tmp/ceph.client.cinder.keyring        /etc/kolla/config/nova/
+sudo scp /tmp/ceph.client.cinder.keyring        /etc/kolla/config/cinder/cinder-volume/
+sudo scp /tmp/ceph.client.cinder.keyring        /etc/kolla/config/cinder/cinder-backup/
+sudo scp /tmp/ceph.client.cinder-backup.keyring /etc/kolla/config/cinder/cinder-backup/
+
+# Purge the keys from beachhead's tmp directory
+rm /tmp/ceph.*
+
+
+#############################################################
+# Take a snapshot of the Kolla nodes  (No Shutdown)
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Checkpoint-VM -SnapshotName "Ceph Installed / Ready for OpenStack Precheck";
+Hyper-V\get-vm | where {$_.name -imatch "beachhead"}    | Checkpoint-VM -SnapshotName "Ceph Installed / Ready for OpenStack Precheck";
+
+
+#############################################################
+# Run the Kolla Ansible OpenStack Precheck from Beachhead
+# Run the following on beachhead (ssh)
+#############################################################
+cd /usr/local/kolla_venv
+source /usr/local/kolla_venv/bin/activate
+kolla-ansible -i /usr/local/kolla_venv/multinode prechecks
+
+
+#############################################################
+# Take a snapshot of the Kolla nodes  (No Shutdown)
+# Run the following on the Hyper-V host via PowerShell
+#############################################################
+Hyper-V\get-vm | where {$_.name -imatch "kolla[1,2,3]"} | Checkpoint-VM -SnapshotName "Ready for OpenStack Deploy";
+
+
+#############################################################
+# Run the Kolla Ansible OpenStack Deploy from Beachhead
+# Run the following on beachhead (ssh)
+#############################################################
+cd /usr/local/kolla_venv
+source /usr/local/kolla_venv/bin/activate
+kolla-ansible -i /usr/local/kolla_venv/multinode deploy
+
+
+# Deploy == Broken!
+#  https://bugs.launchpad.net/kolla-ansible/+bug/1958268
+# TASK [nova-cell : Waiting for nova-compute services to register themselves] ***********************************************************************************************************************************************************
+# skipping: [kolla2]
+# skipping: [kolla3]
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (20 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (19 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (18 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (17 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (16 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (15 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (14 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (13 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (12 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (11 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (10 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (9 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (8 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (7 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (6 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (5 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (4 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (3 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (2 retries left).
+# FAILED - RETRYING: [kolla1]: Waiting for nova-compute services to register themselves (1 retries left).
+# ok: [kolla1]
+# 
+# TASK [nova-cell : Fail if nova-compute service failed to register] ********************************************************************************************************************************************************************
+# fatal: [kolla2]: FAILED! => {"changed": false, "msg": "The Nova compute service failed to register itself on the following hosts: kolla1,kolla2,kolla3"}
+# fatal: [kolla1]: FAILED! => {"changed": false, "msg": "The Nova compute service failed to register itself on the following hosts: kolla1,kolla2,kolla3"}
+# fatal: [kolla3]: FAILED! => {"changed": false, "msg": "The Nova compute service failed to register itself on the following hosts: kolla1,kolla2,kolla3"}
